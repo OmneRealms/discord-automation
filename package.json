@@ -1,0 +1,14 @@
+{
+  "name": "discord-automation",
+  "version": "1.0.0",
+  "description": "OmneRealms Discord bot — bridges bugs/suggestions to GitHub issues",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0",
+    "discord.js": "^14.0.0",
+    "dotenv": "^16.0.0"
+  }
+}
