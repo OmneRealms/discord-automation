@@ -4,7 +4,11 @@
   "description": "OmneRealms Discord bot — bridges bugs/suggestions to GitHub issues",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dedup": "node scripts/dedup-audit.js",
+    "dedup:fix": "node scripts/dedup-audit.js --fix",
+    "dedup:all": "node scripts/dedup-audit.js --all",
+    "dedup:all:fix": "node scripts/dedup-audit.js --all --fix"
   },
   "dependencies": {
     "@octokit/rest": "^21.0.0",
