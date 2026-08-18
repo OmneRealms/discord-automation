@@ -6,9 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "dedup": "node scripts/dedup-audit.js",
-    "dedup:fix": "node scripts/dedup-audit.js --fix",
+    "dedup:fix": "node scripts/dedup-audit.js --fix --yes",
     "dedup:all": "node scripts/dedup-audit.js --all",
-    "dedup:all:fix": "node scripts/dedup-audit.js --all --fix"
+    "dedup:all:fix": "node scripts/dedup-audit.js --all --fix --yes"
   },
   "dependencies": {
     "@octokit/rest": "^21.0.0",
