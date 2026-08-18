@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 // Audits open bug issues in OmneRealms/network for duplicates.
 // Usage:
-//   node scripts/dedup-audit.js             # report only
-//   node scripts/dedup-audit.js --fix       # close dupes + add comments
+//   node scripts/dedup-audit.js                  # report only
+//   node scripts/dedup-audit.js --fix --yes      # close dupes + add comments
+//   node scripts/dedup-audit.js --all            # scan all open issues (report only)
+//   node scripts/dedup-audit.js --fix --all --yes  # scan all + close dupes
 //   node scripts/dedup-audit.js --threshold 0.4  # override similarity threshold
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const { Octokit } = require('@octokit/rest');
 
-const GITHUB_OWNER = 'OmneRealms';
-const GITHUB_REPO = 'network';
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'OmneRealms';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'network';
 const FIX = process.argv.includes('--fix');
+const YES = process.argv.includes('--yes');
 // --all scans every open issue regardless of label
 const ALL = process.argv.includes('--all');
 
@@ -82,7 +85,7 @@ function buildClusters(issueMap, pairs) {
 
   for (const [a, b, score] of pairs) {
     const primary = Math.min(a, b);
-    const dupe    = Math.max(a, b);
+    const dupe = Math.max(a, b);
     if (!groups.has(primary)) groups.set(primary, { issue: issueMap.get(primary), dupes: [] });
     groups.get(primary).dupes.push({ issue: issueMap.get(dupe), score });
   }
@@ -91,8 +94,8 @@ function buildClusters(issueMap, pairs) {
 }
 
 async function main() {
-  console.log(`\nOmneRealms/network — Bug dedup audit`);
-  console.log(`Threshold: ${DUPLICATE_THRESHOLD}  |  Scope: ${ALL ? 'all open issues' : 'bug+discord-report only'}  |  Mode: ${FIX ? 'FIX (will close dupes)' : 'report only'}\n`);
+  console.log(`\n${GITHUB_OWNER}/${GITHUB_REPO} — Bug dedup audit`);
+  console.log(`Threshold: ${DUPLICATE_THRESHOLD}  |  Scope: ${ALL ? 'all open issues' : 'bug+discord-report only'}  |  Mode: ${FIX ? 'FIX requested' : 'report only'}\n`);
 
   process.stdout.write('Fetching open bug issues... ');
   const issues = await getAllBugIssues();
@@ -142,42 +145,55 @@ async function main() {
       console.log(`  DUPE   #${dupe.number} (${Math.round(score * 100)}% overlap): ${dupe.title}`);
       console.log(`         ${dupe.html_url}`);
     }
+  }
 
-    if (FIX) {
-      for (const { issue: dupe, score } of dupes) {
-        try {
-          await octokit.rest.issues.createComment({
-            owner: GITHUB_OWNER,
-            repo: GITHUB_REPO,
-            issue_number: dupe.number,
-            body: [
-              `Closing as duplicate of #${primary.number}.`,
-              '',
-              `_Identified by automated dedup audit (${Math.round(score * 100)}% keyword overlap)._`,
-            ].join('\n'),
-          });
-          await octokit.rest.issues.update({
-            owner: GITHUB_OWNER,
-            repo: GITHUB_REPO,
-            issue_number: dupe.number,
-            state: 'closed',
-            state_reason: 'not_planned',
-          });
-          console.log(`  → Closed #${dupe.number}`);
-        } catch (err) {
-          console.error(`  → Failed to close #${dupe.number}: ${err.message}`);
-        }
+  console.log('\n' + '─'.repeat(60));
+
+  if (!FIX) {
+    console.log('\nDry run only. Review the pairs above before making changes.');
+    console.log('To close the reported duplicates, rerun with --fix --yes.');
+    console.log('Adjust sensitivity with --threshold 0.4 (higher = stricter).\n');
+    return;
+  }
+
+  if (!YES) {
+    console.error('\nRefusing to close issues without explicit confirmation.');
+    console.error('Review the dry-run output, then rerun with --fix --yes.');
+    if (ALL) console.error('Because --all is enabled, this confirmation is especially important.');
+    process.exitCode = 2;
+    return;
+  }
+
+  console.log(`\nConfirmed with --yes. Closing ${dupePairs.length} duplicate pair candidate(s)...\n`);
+
+  for (const { issue: primary, dupes } of clusters) {
+    for (const { issue: dupe, score } of dupes) {
+      try {
+        await octokit.rest.issues.createComment({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          issue_number: dupe.number,
+          body: [
+            `Closing as duplicate of #${primary.number}.`,
+            '',
+            `_Identified by automated dedup audit (${Math.round(score * 100)}% keyword overlap)._`,
+          ].join('\n'),
+        });
+        await octokit.rest.issues.update({
+          owner: GITHUB_OWNER,
+          repo: GITHUB_REPO,
+          issue_number: dupe.number,
+          state: 'closed',
+          state_reason: 'not_planned',
+        });
+        console.log(`  → Closed #${dupe.number}`);
+      } catch (err) {
+        console.error(`  → Failed to close #${dupe.number}: ${err.message}`);
       }
     }
   }
 
-  console.log('\n' + '─'.repeat(60));
-  if (!FIX) {
-    console.log('\nRun with --fix to automatically close duplicates.');
-    console.log('Adjust sensitivity with --threshold 0.4 (higher = stricter).\n');
-  } else {
-    console.log('\nDone.\n');
-  }
+  console.log('\nDone.\n');
 }
 
 main().catch(err => {
