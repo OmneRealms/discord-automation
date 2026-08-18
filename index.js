@@ -4,13 +4,15 @@ const { Octokit } = require('@octokit/rest');
 const fs = require('fs');
 const path = require('path');
 
-const GITHUB_OWNER = 'OmneRealms';
-const GITHUB_REPO = 'network';
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'OmneRealms';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'network';
 const DATA_FILE = path.join(__dirname, 'data', 'processed.json');
 
 const BUGS_CHANNEL = process.env.BUGS_CHANNEL_ID;
 const SUGGESTIONS_CHANNEL = process.env.SUGGESTIONS_CHANNEL_ID;
 const REACTION_THRESHOLD = parseInt(process.env.REACTION_THRESHOLD || '5', 10);
+const BUG_COOLDOWN_MS = parseInt(process.env.BUG_COOLDOWN_MS || '60000', 10);
+const BUG_MAX_PER_WINDOW = parseInt(process.env.BUG_MAX_PER_WINDOW || '3', 10);
 // Fraction of keywords that must overlap to count as a duplicate (0–1)
 const DUPLICATE_THRESHOLD = parseFloat(process.env.DUPLICATE_THRESHOLD || '0.35');
 
@@ -38,6 +40,8 @@ const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 // --- Persistence ---
 
 let processed = { bugs: new Set(), suggestions: new Set() };
+const bugSubmissionWindows = new Map();
+const suggestionInflight = new Set();
 
 function loadProcessed() {
   try {
@@ -58,6 +62,45 @@ function saveProcessed() {
     bugs: [...processed.bugs],
     suggestions: [...processed.suggestions],
   }, null, 2));
+}
+
+function getAttachmentLines(message) {
+  return [...message.attachments.values()].map(attachment => {
+    const label = attachment.name || 'attachment';
+    return `- [${label}](${attachment.url})`;
+  });
+}
+
+function buildReportText(message) {
+  const content = message.content?.trim() || '';
+  const attachments = getAttachmentLines(message);
+  return {
+    content,
+    attachments,
+    searchable: [content, ...attachments.map(line => line.replace(/\[[^\]]+\]\([^\)]+\)/g, 'attachment'))]
+      .filter(Boolean)
+      .join('\n'),
+  };
+}
+
+function consumeBugQuota(userId) {
+  if (!Number.isFinite(BUG_COOLDOWN_MS) || BUG_COOLDOWN_MS <= 0 ||
+      !Number.isFinite(BUG_MAX_PER_WINDOW) || BUG_MAX_PER_WINDOW <= 0) {
+    return { allowed: true };
+  }
+
+  const now = Date.now();
+  const cutoff = now - BUG_COOLDOWN_MS;
+  const recent = (bugSubmissionWindows.get(userId) || []).filter(ts => ts > cutoff);
+
+  if (recent.length >= BUG_MAX_PER_WINDOW) {
+    bugSubmissionWindows.set(userId, recent);
+    return { allowed: false, retryAfterMs: recent[0] + BUG_COOLDOWN_MS - now };
+  }
+
+  recent.push(now);
+  bugSubmissionWindows.set(userId, recent);
+  return { allowed: true };
 }
 
 // --- Duplicate detection ---
@@ -117,7 +160,7 @@ async function findSimilarIssue(content) {
   return null;
 }
 
-async function tallyOnIssue(issue, message) {
+async function tallyOnIssue(issue, message, report) {
   // Count existing tally comments to get total report number
   const { data: comments } = await octokit.rest.issues.listComments({
     owner: GITHUB_OWNER,
@@ -128,17 +171,20 @@ async function tallyOnIssue(issue, message) {
   const tallyCount = comments.filter(c => c.body?.startsWith('📌 **Duplicate report')).length;
   const totalReports = tallyCount + 2; // original + previous tallies + this one
 
+  const body = [
+    `📌 **Duplicate report #${totalReports}**`,
+    '',
+    `**Reporter:** ${message.author.tag}`,
+  ];
+  if (report.content) body.push(`**Message:** ${report.content}`);
+  if (report.attachments.length) body.push('', '**Attachments:**', ...report.attachments);
+  body.push(`**Discord link:** ${messageLink(message)}`);
+
   await octokit.rest.issues.createComment({
     owner: GITHUB_OWNER,
     repo: GITHUB_REPO,
     issue_number: issue.number,
-    body: [
-      `📌 **Duplicate report #${totalReports}**`,
-      '',
-      `**Reporter:** ${message.author.tag}`,
-      `**Message:** ${message.content}`,
-      `**Discord link:** ${messageLink(message)}`,
-    ].join('\n'),
+    body: body.join('\n'),
   });
 
   return issue.html_url;
@@ -187,36 +233,53 @@ client.once('clientReady', async () => {
   console.log(`Ready. Watching #bugs and #suggestions. Duplicate threshold: ${DUPLICATE_THRESHOLD}`);
 });
 
+client.on('error', err => {
+  console.error('[discord] Client error:', err);
+});
+
+client.on('warn', warning => {
+  console.warn('[discord] Warning:', warning);
+});
+
 // #bugs: deduplicate against open issues, tally if match found
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (message.channelId !== BUGS_CHANNEL) return;
   if (processed.bugs.has(message.id)) return;
 
-  const content = message.content.trim();
-  if (!content) return;
+  const report = buildReportText(message);
+  if (!report.content && !report.attachments.length) return;
+
+  const quota = consumeBugQuota(message.author.id);
+  if (!quota.allowed) {
+    const seconds = Math.max(1, Math.ceil(quota.retryAfterMs / 1000));
+    await message.reply(`Too many bug reports in a short period. Please wait about ${seconds}s before submitting another.`).catch(() => {});
+    console.warn(`[bug] Rate-limited ${message.author.tag} (${message.author.id})`);
+    return;
+  }
 
   try {
-    const existing = await findSimilarIssue(content);
+    const existing = await findSimilarIssue(report.searchable);
 
     if (existing) {
-      const url = await tallyOnIssue(existing, message);
+      const url = await tallyOnIssue(existing, message, report);
       processed.bugs.add(message.id);
       saveProcessed();
       await message.react('🔁').catch(() => {});
       console.log(`[bug] Tallied on existing issue #${existing.number}: ${url}`);
     } else {
-      const title = content.length > 100 ? content.slice(0, 97) + '...' : content;
+      const titleSource = report.content || `Bug report with ${report.attachments.length} attachment${report.attachments.length === 1 ? '' : 's'}`;
+      const title = titleSource.length > 100 ? titleSource.slice(0, 97) + '...' : titleSource;
       const body = [
         `**Reporter:** ${message.author.tag}`,
         '',
         '**Bug description:**',
-        content,
-        '',
-        `**Discord message:** ${messageLink(message)}`,
-      ].join('\n');
+        report.content || '_No text provided; see attachments below._',
+      ];
+      if (report.attachments.length) body.push('', '**Attachments:**', ...report.attachments);
+      body.push('', `**Discord message:** ${messageLink(message)}`);
 
-      const url = await createIssue(title, body, ['bug', 'discord-report']);
+      const url = await createIssue(title, body.join('\n'), ['bug', 'discord-report']);
       processed.bugs.add(message.id);
       saveProcessed();
       await message.react('✅').catch(() => {});
@@ -242,7 +305,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
   const message = reaction.message;
   if (message.channelId !== SUGGESTIONS_CHANNEL) return;
-  if (processed.suggestions.has(message.id)) return;
+  if (processed.suggestions.has(message.id) || suggestionInflight.has(message.id)) return;
 
   const count = reaction.count;
   if (count < REACTION_THRESHOLD) return;
@@ -250,6 +313,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   const content = message.content?.trim();
   if (!content) return;
 
+  suggestionInflight.add(message.id);
   try {
     const title = content.length > 100 ? content.slice(0, 97) + '...' : content;
     const body = [
@@ -268,6 +332,8 @@ client.on('messageReactionAdd', async (reaction, user) => {
     console.log(`[suggestion] Issue created (${count} reactions): ${url}`);
   } catch (err) {
     console.error('[suggestion] Failed to create issue:', err.message);
+  } finally {
+    suggestionInflight.delete(message.id);
   }
 });
 
